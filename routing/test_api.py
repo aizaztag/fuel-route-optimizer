@@ -421,11 +421,11 @@ def test_long_route_returns_located_costed_fuel_stops(monkeypatch, settings):
     }
     assert response.data['total_estimated_fuel_cost'] == 120.0
     assert response.data['optimization_status'] == 'optimized'
-    assert response.data['station_coverage']['stations_considered'] == 1
-    assert response.data['station_coverage']['stations_geocoded'] == 1
+    assert response.data['station_coverage']['stations_considered'] == 2
+    assert response.data['station_coverage']['stations_geocoded'] == 2
     assert response.data['station_coverage']['candidates_available'] == 2
     assert response.data['station_coverage']['candidates_excluded_by_limit'] == 1
-    assert response.data['station_coverage']['stations_matched'] == 1
+    assert response.data['station_coverage']['stations_matched'] == 2
     station_diagnostics = response.data['diagnostics']['station_geocoding']
     assert station_diagnostics['cache_hits'] == 0
     assert station_diagnostics['cache_misses'] == 0

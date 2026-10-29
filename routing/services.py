@@ -149,9 +149,14 @@ class RoutePlanningService:
             warnings.append(
                 'Station access and detour distances are straight-line estimates, not exact driving routes.'
             )
-            if station_coverage['stations_skipped'] or station_coverage['candidates_excluded_by_limit']:
+            if station_coverage['stations_skipped']:
                 warnings.append(
-                    'Some candidates lack stored coordinates or were not evaluated because the candidate limit was reached.'
+                    'Some corridor candidates lack stored coordinates and could not be route-matched.'
+                )
+            if station_coverage['candidates_excluded_by_limit']:
+                warnings.append(
+                    'Some route-matched candidates were omitted from the bounded shortlist; '
+                    'the complete matched set was checked for feasibility and estimated cost.'
                 )
         return warnings
 
@@ -190,27 +195,7 @@ class RoutePlanningService:
             )
             for key in ('matched', 'no_match', 'failed', 'missing_or_stale')
         }
-        candidates_by_state: dict[str, list] = {}
-        for station in sorted(located_candidates, key=lambda item: item.station_id):
-            candidates_by_state.setdefault(station.state, []).append(station)
         limit = max(0, settings.STATION_GEOCODING_CANDIDATE_LIMIT)
-        selected = []
-        selected_per_state = {state: 0 for state in sorted(candidate_states)}
-        while len(selected) < limit:
-            added = False
-            for state in sorted(candidate_states):
-                bucket = candidates_by_state.get(state, [])
-                index = selected_per_state[state]
-                if index < len(bucket):
-                    selected.append(bucket[index])
-                    selected_per_state[state] += 1
-                    added = True
-                    if len(selected) >= limit:
-                        break
-            if not added:
-                break
-        selection_duration_ms = round((perf_counter() - selection_started) * 1000, 3)
-        self._diagnostics['timings_ms']['candidate_station_selection'] = selection_duration_ms
         self._diagnostics['station_coordinate_lookup'].update({
             'matched_coordinates_available': sum(
                 station.state in candidate_states and station.latitude is not None
@@ -221,94 +206,116 @@ class RoutePlanningService:
             'missing_or_stale_records': corridor_coordinate_stats['missing_or_stale'],
         })
         logger.info(
-            'Candidate station selection: duration_ms=%.3f dataset_stations=%d '
-            'candidate_states=%s candidates_available=%d stored_coordinates=%d selected=%d',
-            selection_duration_ms, len(dataset.stations), sorted(candidate_states),
-            len(all_candidates), len(located_candidates), len(selected),
+            'Candidate pool: dataset_stations=%d candidate_states=%s '
+            'candidates_available=%d stored_coordinates=%d',
+            len(dataset.stations), sorted(candidate_states),
+            len(all_candidates), len(located_candidates),
         )
 
-        matched: list[Any] = []
-        geocode_failures = 0
-        matching_duration_ms = 0.0
-        optimization_duration_ms = 0.0
-        optimization_iterations = 0
-        plan = None
-        candidates_evaluated = 0
-
-        # Candidate matching now uses coordinates enriched in a separate local batch.
-        # Normal route requests never geocode fuel stations.
-        for station in selected[:limit]:
-            candidates_evaluated += 1
-            matching_started = perf_counter()
-            place = {'coordinates': {
+        matching_started = perf_counter()
+        station_places = [
+            (station, {'coordinates': {
                 'latitude': station.latitude,
                 'longitude': station.longitude,
-            }}
-            matched.extend(self.matcher.match_many(
-                [(station, place)], route['geometry'], route['distance_miles']
-            ))
-            matched.sort(key=lambda candidate: (
-                candidate.along_route_mile, candidate.station.station_id
-            ))
-            matching_duration_ms += (perf_counter() - matching_started) * 1000
+            }})
+            for station in located_candidates
+        ]
+        matched: list[Any] = self.matcher.match_many(
+            station_places, route['geometry'], route['distance_miles']
+        )
+        matching_duration_ms = (perf_counter() - matching_started) * 1000
 
-            # Re-run the existing dynamic program on the accumulated matched set.
-            # A feasible result is valid under the optimizer's per-leg range checks;
-            # it is the best result found so far, not a global-cost guarantee.
-            optimization_started = perf_counter()
-            plan = self.optimizer.optimize(
-                route_distance_miles=route['distance_miles'],
-                candidates=matched,
-                max_range_miles=settings.VEHICLE_MAX_RANGE_MILES,
-                fuel_economy_mpg=settings.VEHICLE_FUEL_ECONOMY_MPG,
-            )
-            optimization_duration_ms += (perf_counter() - optimization_started) * 1000
-            optimization_iterations += 1
-            if plan.feasible:
-                break
+        # Apply the budget only after route matching. Preserve the stops from the
+        # best feasible full-corridor plan, then use route-position coverage to fill
+        # the remaining slots; sorting by state or station ID alone missed the route.
+        selection_started = perf_counter()
+        full_plan = self.optimizer.optimize(
+            route_distance_miles=route['distance_miles'],
+            candidates=matched,
+            max_range_miles=settings.VEHICLE_MAX_RANGE_MILES,
+            fuel_economy_mpg=settings.VEHICLE_FUEL_ECONOMY_MPG,
+        )
+        by_id = {candidate.station.station_id: candidate for candidate in matched}
+        required_ids = {stop['station_id'] for stop in full_plan.stops} if full_plan.feasible else set()
+        selected = sorted(
+            (by_id[station_id] for station_id in required_ids),
+            key=lambda candidate: (candidate.along_route_mile, candidate.station.station_id),
+        )
+        # A feasible plan's complete stop sequence takes precedence over the cap.
+        shortlist_limit = max(limit, len(selected))
+        while len(selected) < min(shortlist_limit, len(matched)):
+            remaining = [candidate for candidate in matched if candidate not in selected]
+            if not selected:
+                chosen = min(remaining, key=lambda c: (c.along_route_mile, c.station.station_id))
+            else:
+                chosen = max(
+                    remaining,
+                    key=lambda candidate: (
+                        min(abs(candidate.along_route_mile - kept.along_route_mile) for kept in selected),
+                        -candidate.distance_from_route_miles,
+                        -float(candidate.station.retail_price),
+                        -candidate.along_route_mile,
+                        candidate.station.station_id,
+                    ),
+                )
+            selected.append(chosen)
+            selected.sort(key=lambda c: (c.along_route_mile, c.station.station_id))
+        selection_duration_ms = round((perf_counter() - selection_started) * 1000, 3)
+        self._diagnostics['timings_ms']['candidate_station_selection'] = selection_duration_ms
+        logger.info(
+            'Route-matched candidate shortlist: duration_ms=%.3f route_matched=%d selected=%d budget=%d',
+            selection_duration_ms, len(matched), len(selected), limit,
+        )
 
-        # Even if every lookup failed or missed the route, produce the optimizer's
-        # standard infeasible result without changing its behavior.
-        if plan is None:
-            optimization_started = perf_counter()
-            plan = self.optimizer.optimize(
-                route_distance_miles=route['distance_miles'],
-                candidates=matched,
-                max_range_miles=settings.VEHICLE_MAX_RANGE_MILES,
-                fuel_economy_mpg=settings.VEHICLE_FUEL_ECONOMY_MPG,
-            )
-            optimization_duration_ms += (perf_counter() - optimization_started) * 1000
-            optimization_iterations += 1
-
-        not_evaluated_after_stop = len(selected) - candidates_evaluated
+        optimization_started = perf_counter()
+        plan = self.optimizer.optimize(
+            route_distance_miles=route['distance_miles'],
+            candidates=selected,
+            max_range_miles=settings.VEHICLE_MAX_RANGE_MILES,
+            fuel_economy_mpg=settings.VEHICLE_FUEL_ECONOMY_MPG,
+        )
+        optimization_duration_ms = (perf_counter() - optimization_started) * 1000
+        optimization_iterations = 1
+        # Every route-matched candidate was evaluated by the full-candidate DP
+        # feasibility/cost pass above; this is separate from the bounded shortlist.
+        candidates_evaluated = len(matched)
+        not_evaluated_after_stop = 0
         if plan.feasible:
             stop_reason = 'feasible_plan_found'
         elif not all_candidates:
             stop_reason = 'no_candidates_available'
         elif not located_candidates:
             stop_reason = 'no_stored_coordinates_available'
-        elif candidates_evaluated >= len(located_candidates):
+        elif candidates_evaluated >= len(matched):
             stop_reason = 'all_located_corridor_candidates_evaluated'
         elif candidates_evaluated >= limit:
             stop_reason = 'candidate_budget_exhausted'
         else:
             stop_reason = 'candidate_search_ended'
         search_complete = candidates_evaluated >= len(all_candidates)
-        located_search_complete = candidates_evaluated >= len(located_candidates)
+        located_search_complete = len(matched) == len(located_candidates)
         self._diagnostics['candidate_search'] = {
             'candidate_budget': limit,
             'candidates_available_in_corridor': len(all_candidates),
             'candidates_with_stored_coordinates': len(located_candidates),
+            'candidates_route_matched': len(matched),
+            'candidates_prechecked_by_optimizer': len(matched),
             'candidates_without_stored_coordinates': len(all_candidates) - len(located_candidates),
             'candidates_selected_for_evaluation': len(selected),
             'candidates_shortlisted': len(selected),
             'candidates_evaluated': candidates_evaluated,
+            'selected_candidate_ids': [candidate.station.station_id for candidate in selected],
+            'route_matched_candidates_excluded_by_limit': len(matched) - len(selected),
             'station_geocoding_attempts': 0,
             'candidates_not_evaluated_after_stop': not_evaluated_after_stop,
             'search_complete_within_corridor': search_complete,
             'search_complete_within_located_corridor': located_search_complete,
             'globally_complete': False,
-            'optimality_scope': 'best_among_evaluated_candidates',
+            'optimality_scope': (
+                'best_among_route_matched_candidates'
+                if full_plan.feasible
+                else 'no_feasible_plan_among_route_matched_candidates'
+            ),
             'stop_reason': stop_reason,
             'optimization_iterations': optimization_iterations,
         }
@@ -324,8 +331,8 @@ class RoutePlanningService:
         matching_duration_ms = round(matching_duration_ms, 3)
         self._diagnostics['timings_ms']['station_route_matching'] = matching_duration_ms
         logger.info(
-            'Station route matching: duration_ms=%.3f evaluated=%d matched=%d',
-            matching_duration_ms, candidates_evaluated, len(matched),
+            'Station route matching: duration_ms=%.3f stored_coordinates_checked=%d matched=%d',
+            matching_duration_ms, len(located_candidates), len(matched),
         )
         self._diagnostics['timings_ms']['fuel_optimization'] = round(
             optimization_duration_ms, 3
@@ -344,13 +351,13 @@ class RoutePlanningService:
             for candidate in matched
         ]
         coverage = {
-            'stations_considered': candidates_evaluated,
-            'stations_geocoded': candidates_evaluated,
+            'stations_considered': len(located_candidates),
+            'stations_geocoded': len(located_candidates),
             'stations_skipped': len(all_candidates) - len(located_candidates),
             'stations_matched': len(matched),
             'stations_eligible': len(matched),
             'candidates_available': len(all_candidates),
-            'candidates_excluded_by_limit': len(located_candidates) - len(selected),
+            'candidates_excluded_by_limit': len(matched) - len(selected),
             'geocode_failures': corridor_coordinate_stats['failed'],
             'stored_coordinate_matches_available': len(located_candidates),
             'stored_coordinate_no_matches': corridor_coordinate_stats['no_match'],
@@ -423,12 +430,12 @@ class RoutePlanningService:
         if not plan.feasible:
             logger.warning(
                 'No feasible fuel plan: route_miles=%.2f max_range_miles=%.2f '
-                'dataset_stations=%d candidates_available=%d selected=%d geocoded=%d '
-                'matched=%d matched_positions=%s',
+                'dataset_stations=%d candidates_available=%d stored_coordinates=%d '
+                'route_matched=%d shortlisted=%d matched_positions=%s',
                 route['distance_miles'], settings.VEHICLE_MAX_RANGE_MILES,
                 coverage['dataset_stations_loaded'], coverage['candidates_available'],
-                coverage['stations_considered'], coverage['stations_geocoded'],
-                coverage['stations_matched'], coverage['matched_candidate_positions'],
+                coverage['stations_considered'], coverage['stations_matched'],
+                coverage['candidates_selected_for_evaluation'], coverage['matched_candidate_positions'],
             )
         warnings = self._warning_messages(route['distance_miles'], coverage)
         candidate_search = self._diagnostics['candidate_search']
@@ -533,7 +540,7 @@ class RoutePlanningService:
                 'optimality_scope': (
                     candidate_search['optimality_scope']
                     if plan.feasible
-                    else 'no_feasible_plan_among_evaluated_candidates'
+                    else candidate_search['optimality_scope']
                 ),
                 'candidate_search_complete_within_corridor': candidate_search[
                     'search_complete_within_corridor'

@@ -81,7 +81,7 @@ def test_intermediate_state_stations_can_form_a_feasible_chicago_denver_plan(set
     )
 
 
-def test_incremental_search_stops_at_first_feasible_multistop_plan(settings):
+def test_route_matched_search_keeps_feasible_multistop_plan(settings):
     start = {'latitude': 41.0, 'longitude': -90.0}
     finish = {'latitude': 40.0, 'longitude': -80.0}
     distance_miles = 1200.0
@@ -127,16 +127,16 @@ def test_incremental_search_stops_at_first_feasible_multistop_plan(settings):
     assert result['diagnostics']['station_geocoding']['requests'] == []
     assert [stop['station_id'] for stop in result['fuel_stops']] == ['01', '02']
     assert result['fuel_optimization']['feasible'] is True
-    assert result['fuel_optimization']['optimality_scope'] == 'best_among_evaluated_candidates'
-    assert result['fuel_optimization']['candidate_search_complete_within_corridor'] is False
+    assert result['fuel_optimization']['optimality_scope'] == 'best_among_route_matched_candidates'
+    assert result['fuel_optimization']['candidate_search_complete_within_corridor'] is True
     search = result['diagnostics']['candidate_search']
     assert search['candidate_budget'] == 8
     assert search['candidates_available_in_corridor'] == 3
     assert search['candidates_shortlisted'] == 3
-    assert search['candidates_evaluated'] == 2
+    assert search['candidates_evaluated'] == 3
     assert search['station_geocoding_attempts'] == 0
-    assert search['candidates_evaluated'] == 2
-    assert search['candidates_not_evaluated_after_stop'] == 1
+    assert search['candidates_prechecked_by_optimizer'] == 3
+    assert search['candidates_not_evaluated_after_stop'] == 0
     assert search['stop_reason'] == 'feasible_plan_found'
     assert search['globally_complete'] is False
     positions_with_endpoints = [
@@ -149,10 +149,10 @@ def test_incremental_search_stops_at_first_feasible_multistop_plan(settings):
         <= settings.VEHICLE_MAX_RANGE_MILES
         for index in range(len(positions_with_endpoints) - 1)
     )
-    assert any('unevaluated stations may offer a lower' in warning for warning in result['warnings'])
+    assert any('candidate limit' in warning for warning in result['warnings'])
 
 
-def test_eight_candidate_budget_is_enforced_and_no_plan_is_scoped_to_evaluated_candidates():
+def test_candidate_budget_is_applied_after_matching_and_no_plan_is_scoped_to_matched_candidates():
     start = {'latitude': 41.0, 'longitude': -90.0}
     finish = {'latitude': 40.0, 'longitude': -80.0}
     distance_miles = 1200.0
@@ -194,20 +194,96 @@ def test_eight_candidate_budget_is_enforced_and_no_plan_is_scoped_to_evaluated_c
     assert result['optimization_status'] == 'no_feasible_plan'
     assert result['fuel_stops'] == []
     assert result['total_stop_purchase_cost'] is None
-    assert 'among 8 evaluated station candidates' in result['fuel_optimization']['message']
-    assert result['fuel_optimization']['optimality_scope'] == 'no_feasible_plan_among_evaluated_candidates'
+    assert 'among 23 evaluated station candidates' in result['fuel_optimization']['message']
+    assert result['fuel_optimization']['optimality_scope'] == 'no_feasible_plan_among_route_matched_candidates'
     search = result['diagnostics']['candidate_search']
     assert search['candidate_budget'] == 8
     assert search['candidates_available_in_corridor'] == 23
     assert search['candidates_selected_for_evaluation'] == 8
     assert search['candidates_shortlisted'] == 8
-    assert search['candidates_evaluated'] == 8
+    assert search['candidates_route_matched'] == 23
+    assert search['candidates_prechecked_by_optimizer'] == 23
+    assert search['candidates_evaluated'] == 23
     assert search['station_geocoding_attempts'] == 0
-    assert search['stop_reason'] == 'candidate_budget_exhausted'
-    assert search['search_complete_within_corridor'] is False
+    assert search['stop_reason'] == 'all_located_corridor_candidates_evaluated'
+    assert search['search_complete_within_corridor'] is True
     assert result['station_coverage']['candidates_excluded_by_limit'] == 15
-    assert len(result['station_coverage']['matched_candidate_positions']) == 8
+    assert len(result['station_coverage']['matched_candidate_positions']) == 23
+    assert len(search['selected_candidate_ids']) == 8
+    candidate_positions = {
+        item['station_id']: item['along_route_mile']
+        for item in result['station_coverage']['matched_candidate_positions']
+    }
+    selected_positions = [candidate_positions[item] for item in search['selected_candidate_ids']]
+    assert selected_positions == sorted(selected_positions)
+    assert selected_positions[0] == 650.0
+    assert selected_positions[-1] == 672.0
     assert all(candidate['along_route_mile'] > 500 for candidate in result['station_coverage']['matched_candidate_positions'])
+
+
+def test_candidates_after_original_eight_are_matched_and_can_make_plan_feasible(settings):
+    start = {'latitude': 41.8, 'longitude': -87.6}
+    finish = {'latitude': 39.7, 'longitude': -105.0}
+    distance_miles = 1004.4
+
+    def point_at(position, *, latitude_offset=0.0):
+        fraction = position / distance_miles
+        return (
+            start['latitude'] + (finish['latitude'] - start['latitude']) * fraction + latitude_offset,
+            start['longitude'] + (finish['longitude'] - start['longitude']) * fraction,
+        )
+
+    stations = tuple(
+        FuelStation(
+            f'{index:02}', f'Station {index}', f'Address {index}', 'Iowa City', 'IA',
+            Decimal('3.50'), *point_at(100 + index * 10, latitude_offset=3.0),
+        )
+        for index in range(8)
+    ) + (
+        FuelStation('08', 'Route stop 1', 'I-80', 'Iowa City', 'IA', Decimal('3.50'), *point_at(300)),
+        FuelStation('09', 'Route stop 2', 'I-80', 'Omaha', 'NE', Decimal('3.40'), *point_at(700)),
+    )
+    dataset = StationDataset(stations, StationLoadStats(10, 0, 0, 0, 0))
+
+    class StubRepository:
+        def load(self):
+            return dataset
+
+    class StubGeocoder:
+        def verify_us_coordinates(self, coordinates):
+            return {'coordinates': coordinates, 'state_code': 'IL' if coordinates == start else 'CO'}
+
+    route_calls = []
+
+    class StubRouter:
+        def route(self, _start, _finish):
+            route_calls.append((_start, _finish))
+            return {
+                'distance_miles': distance_miles,
+                'duration_minutes': 1069,
+                'geometry': {'type': 'LineString', 'coordinates': [
+                    [start['longitude'], start['latitude']],
+                    [finish['longitude'], finish['latitude']],
+                ]},
+            }
+
+    with override_settings(STATION_GEOCODING_CANDIDATE_LIMIT=8):
+        result = RoutePlanningService(
+            geocoder=StubGeocoder(), router=StubRouter(), station_repository=StubRepository()
+        ).plan({'start': start, 'finish': finish})
+
+    assert result['optimization_status'] == 'optimized'
+    assert [stop['station_id'] for stop in result['fuel_stops']] == ['08', '09']
+    legs = result['fuel_optimization']['route_legs']
+    assert [leg['estimated_distance_miles'] for leg in legs] == [300.0, 400.0, 304.4]
+    assert all(leg['within_maximum_range'] for leg in legs)
+    assert result['station_coverage']['stations_considered'] == 10
+    assert result['station_coverage']['stations_matched'] == 2
+    search = result['diagnostics']['candidate_search']
+    assert search['candidates_route_matched'] == 2
+    assert search['selected_candidate_ids'] == ['08', '09']
+    assert len(route_calls) == 1
+    assert result['diagnostics']['station_coordinate_lookup']['outbound_http_requests'] == 0
 
 
 def test_station_candidates_use_stored_coordinates_without_station_geocoding(settings):
@@ -340,10 +416,10 @@ def test_cold_long_route_stops_after_feasible_candidate_and_reuses_cache(monkeyp
         assert cold['diagnostics']['station_coordinate_lookup']['outbound_http_requests'] == 0
         assert cold['diagnostics']['candidate_search']['candidate_budget'] == 8
         assert cold['diagnostics']['candidate_search']['candidates_shortlisted'] == 8
-        assert cold['diagnostics']['candidate_search']['candidates_evaluated'] == 1
+        assert cold['diagnostics']['candidate_search']['candidates_evaluated'] == 25
         assert cold['diagnostics']['candidate_search']['stop_reason'] == 'feasible_plan_found'
         assert cold['diagnostics']['candidate_search']['globally_complete'] is False
-        assert cold['station_coverage']['candidates_not_evaluated_after_stop'] == 7
+        assert cold['station_coverage']['candidates_not_evaluated_after_stop'] == 0
         assert calls == {'nominatim': 2, 'osrm': 1}
 
         repeated = run_plan()
