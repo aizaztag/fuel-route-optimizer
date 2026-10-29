@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>Fuel Route Optimizer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #182230; background: #f3f6fa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { width: min(1180px, 100% - 32px); margin: 28px auto; }
+    h1 { margin: 0 0 6px; font-size: clamp(1.6rem, 4vw, 2.2rem); }
+    .intro { margin: 0 0 22px; color: #526174; }
+    .panel { background: white; border: 1px solid #dce3ec; border-radius: 12px; padding: 18px; box-shadow: 0 5px 20px #13243a0b; }
+    form { display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .mode, .actions { grid-column: 1 / -1; }
+    label { display: grid; gap: 6px; font-weight: 600; }
+    input, select, button { font: inherit; }
+    input, select { width: 100%; padding: 10px 11px; border: 1px solid #bbc7d5; border-radius: 7px; }
+    .coordinate-group { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    button { padding: 11px 16px; border: 0; border-radius: 7px; background: #1261a0; color: white; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .65; cursor: wait; }
+    .actions { display: flex; align-items: center; gap: 12px; }
+    #message { min-height: 1.5em; color: #526174; }
+    #message.error { color: #a12622; }
+    #results { margin-top: 22px; }
+    #plan-heading { margin: 0 0 12px; font-size: 1.45rem; }
+    #summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    #summary span { display: grid; gap: 4px; padding: 12px; border: 1px solid #dce3ec; border-radius: 9px; background: white; }
+    #summary strong { color: #123f68; }
+    #cost-note { color: #526174; font-size: .92rem; }
+    #fuel-stops-panel { margin: 14px 0; }
+    #fuel-stops-panel h3 { margin: 0 0 8px; font-size: 1.05rem; }
+    #fuel-stops-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+    #fuel-stops-list li { padding: 11px 13px; border: 1px solid #dce3ec; border-radius: 8px; background: white; }
+    #fuel-stops-list small { display: block; margin-top: 4px; color: #526174; }
+    #coverage-panel { margin: 10px 0; color: #526174; font-size: .9rem; }
+    #coverage-details { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #map { height: min(64vh, 620px); min-height: 360px; border-radius: 10px; border: 1px solid #dce3ec; }
+    .stop-icon { display: grid; place-items: center; width: 30px; height: 30px; border: 2px solid white; border-radius: 50%; background: #13824b; color: white; font-weight: 800; box-shadow: 0 1px 5px #0008; }
+    [hidden] { display: none !important; }
+    @media (max-width: 620px) { form { grid-template-columns: 1fr; } .mode, .actions { grid-column: auto; } main { width: calc(100% - 20px); margin: 16px auto; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Fuel Route Optimizer</h1>
+  <p class="intro">Plan a US driving route and view the located fuel stops selected from the supplied fuel-price dataset.</p>
+  <section class="panel" aria-label="Route inputs">
+    <form id="route-form">
+      <label class="mode" for="input-mode">Location input
+        <select id="input-mode"><option value="address">US addresses</option><option value="coordinates">Latitude and longitude</option></select>
+      </label>
+      <label class="address-field" for="start-address">Start address
+        <input id="start-address" autocomplete="street-address" value="Chicago, IL" required>
+      </label>
+      <label class="address-field" for="finish-address">Finish address
+        <input id="finish-address" autocomplete="street-address" value="Denver, CO" required>
+      </label>
+      <label class="coordinate-field" for="start-lat" hidden>Start coordinates
+        <span class="coordinate-group"><input id="start-lat" type="number" step="any" placeholder="Latitude" value="40.7128"><input id="start-lon" type="number" step="any" placeholder="Longitude" value="-74.0060"></span>
+      </label>
+      <label class="coordinate-field" for="finish-lat" hidden>Finish coordinates
+        <span class="coordinate-group"><input id="finish-lat" type="number" step="any" placeholder="Latitude" value="42.3601"><input id="finish-lon" type="number" step="any" placeholder="Longitude" value="-71.0589"></span>
+      </label>
+      <div class="actions"><button id="submit" type="submit">Plan route</button><span id="message" role="status" aria-live="polite"></span></div>
+    </form>
+  </section>
+  <section id="results" hidden aria-label="Route results">
+    <h2 id="plan-heading">Estimated cost-effective fuel plan</h2>
+    <div id="summary"></div>
+    <p id="cost-note"></p>
+    <section id="fuel-stops-panel" aria-label="Selected fuel stops">
+      <h3>Selected fuel stops</h3>
+      <ol id="fuel-stops-list"></ol>
+    </section>
+    <div id="map" role="region" aria-label="Map showing the route and fuel stops"></div>
+    <details id="coverage-panel"><summary>Station search diagnostics</summary><pre id="coverage-details"></pre></details>
+  </section>
+</main>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+(() => {
+  const form = document.getElementById('route-form');
+  const mode = document.getElementById('input-mode');
+  const message = document.getElementById('message');
+  const results = document.getElementById('results');
+  const button = document.getElementById('submit');
+  const addressFields = [...document.querySelectorAll('.address-field')];
+  const coordinateFields = [...document.querySelectorAll('.coordinate-field')];
+  const map = L.map('map').setView([39.5, -98.35], 4);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+  let resultLayer = null;
+
+  mode.addEventListener('change', () => {
+    const useCoordinates = mode.value === 'coordinates';
+    addressFields.forEach((field) => { field.hidden = useCoordinates; field.querySelector('input').required = !useCoordinates; });
+    coordinateFields.forEach((field) => { field.hidden = !useCoordinates; });
+  });
+
+  function showError(payload, status) {
+    const detail = payload && payload.detail;
+    message.textContent = typeof detail === 'string' ? detail : JSON.stringify(detail || payload || `HTTP ${status}`);
+    message.className = 'error';
+  }
+
+  function addPopup(marker, title, lines) {
+    const content = document.createElement('div');
+    const heading = document.createElement('strong');
+    heading.textContent = title;
+    content.appendChild(heading);
+    lines.forEach((line) => {
+      const paragraph = document.createElement('div');
+      paragraph.textContent = line;
+      content.appendChild(paragraph);
+    });
+    marker.bindPopup(content);
+  }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    message.textContent = 'Requesting route…';
+    message.className = '';
+    button.disabled = true;
+    const payload = mode.value === 'address' ? {
+      start_address: document.getElementById('start-address').value.trim(),
+      finish_address: document.getElementById('finish-address').value.trim()
+    } : {
+      start: { latitude: Number(document.getElementById('start-lat').value), longitude: Number(document.getElementById('start-lon').value) },
+      finish: { latitude: Number(document.getElementById('finish-lat').value), longitude: Number(document.getElementById('finish-lon').value) }
+    };
+    try {
+      const response = await fetch('/api/v1/route-plan/', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json();
+      if (!response.ok) { showError(data, response.status); return; }
+      message.textContent = 'Route plan ready.';
+      results.hidden = false;
+      document.getElementById('summary').replaceChildren();
+      document.getElementById('plan-heading').textContent = 'Estimated cost-effective fuel plan';
+      const fuelOptimization = data.fuel_optimization || {};
+      const fuelStops = data.fuel_stops || [];
+      const values = [
+        ['Distance', `${Number(data.distance_miles).toFixed(1)} miles`],
+        ['Estimated duration', `${Number(data.estimated_duration_minutes).toFixed(0)} minutes`],
+        ['Estimated fuel purchase cost', data.total_stop_purchase_cost == null ? 'Unavailable' : `$${Number(data.total_stop_purchase_cost).toFixed(2)}`],
+        ['Maximum leg range', `${Number(fuelOptimization.maximum_range_miles).toFixed(0)} miles`],
+        ['Fuel economy assumption', `${Number(fuelOptimization.fuel_economy_mpg).toFixed(0)} MPG`],
+        ['Optimization status', data.optimization_status],
+        ['Selected fuel stops', String(fuelStops.length)]
+      ];
+      values.forEach(([label, value]) => {
+        const item = document.createElement('span');
+        const strong = document.createElement('strong');
+        strong.textContent = `${label}: `;
+        item.append(strong, document.createTextNode(value));
+        document.getElementById('summary').appendChild(item);
+      });
+      document.getElementById('cost-note').textContent =
+        `Cost estimates fuel purchased at selected stops only. The vehicle starts with a full tank, whose cost is excluded. Assumes ${Number(fuelOptimization.fuel_economy_mpg).toFixed(0)} MPG.`;
+      const stopsList = document.getElementById('fuel-stops-list');
+      stopsList.replaceChildren();
+      if (fuelStops.length) {
+        fuelStops.forEach((stop, index) => {
+          const item = document.createElement('li');
+          const name = document.createElement('strong');
+          name.textContent = `${index + 1}. ${stop.name || `Fuel stop ${index + 1}`}`;
+          const location = document.createElement('small');
+          location.textContent = [stop.address, stop.city, stop.state].filter(Boolean).join(', ');
+          const purchase = document.createElement('small');
+          purchase.textContent = `$${Number(stop.price_per_gallon).toFixed(2)}/gal · Estimated purchase $${Number(stop.estimated_purchase_cost).toFixed(2)} · Approx. mile ${Number(stop.approximate_along_route_mile).toFixed(1)}`;
+          item.append(name, location, purchase);
+          stopsList.appendChild(item);
+        });
+      } else {
+        const item = document.createElement('li');
+        item.textContent = fuelOptimization.feasible
+          ? 'No fuel stops are needed for this route.'
+          : (fuelOptimization.message || 'No feasible plan was found among the evaluated candidates.');
+        stopsList.appendChild(item);
+      }
+      const coverage = data.station_coverage || {};
+      document.getElementById('coverage-details').textContent = [
+        `Unique CSV stations loaded: ${coverage.dataset_stations_loaded ?? 'not reported'}`,
+        `Candidate states evaluated: ${(coverage.candidate_states_evaluated || []).join(', ') || 'none'}`,
+        `Candidates available / selected / geocoded / matched: ${coverage.candidates_available ?? 0} / ${coverage.stations_considered ?? 0} / ${coverage.stations_geocoded ?? 0} / ${coverage.stations_matched ?? 0}`,
+        `Matched positions and access offsets: ${JSON.stringify(coverage.matched_candidate_positions || [])}`
+      ].join('\n');
+      if (resultLayer) map.removeLayer(resultLayer);
+      resultLayer = L.featureGroup();
+      const route = L.geoJSON(data.geometry, { style: { color: '#1769aa', weight: 5, opacity: .85 } });
+      resultLayer.addLayer(route);
+      const start = L.marker([data.start.latitude, data.start.longitude]);
+      addPopup(start, 'Start', []);
+      resultLayer.addLayer(start);
+      const finish = L.marker([data.finish.latitude, data.finish.longitude]);
+      addPopup(finish, 'Finish', []);
+      resultLayer.addLayer(finish);
+      fuelStops.forEach((stop, index) => {
+        const coordinates = data.geometry.coordinates;
+        const position = Number(stop.approximate_along_route_mile) / Number(data.distance_miles);
+        const lineIndex = Math.max(0, Math.min(coordinates.length - 1, Math.round(position * (coordinates.length - 1))));
+        const point = coordinates[lineIndex];
+        const stopPoint = stop.coordinates ? [stop.coordinates.latitude, stop.coordinates.longitude] : [point[1], point[0]];
+        const marker = L.marker(stopPoint, { icon: L.divIcon({ className: '', html: `<span class="stop-icon">${index + 1}</span>`, iconSize: [30, 30], iconAnchor: [15, 15] }) });
+        addPopup(marker, stop.name || `Fuel stop ${index + 1}`, [
+          [stop.address, stop.city, stop.state].filter(Boolean).join(', '),
+          `$${Number(stop.price_per_gallon).toFixed(2)} per gallon`,
+          `Estimated purchase: $${Number(stop.estimated_purchase_cost).toFixed(2)}`
+        ]);
+        resultLayer.addLayer(marker);
+      });
+      resultLayer.addTo(map);
+      map.fitBounds(resultLayer.getBounds().pad(.12), { maxZoom: 12 });
+      setTimeout(() => map.invalidateSize(), 0);
+    } catch (error) {
+      showError({ detail: 'Could not contact the local route API. Confirm the Django server is running and try again.' }, 0);
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

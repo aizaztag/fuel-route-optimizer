@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Django generated files
+*.log
+local_settings.py
+db.sqlite3
+media/
+staticfiles/
+fuel-prices-for-be-assessment.csv
+
+# Test and tooling caches
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
